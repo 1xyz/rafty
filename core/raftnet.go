@@ -21,6 +21,7 @@ type RaftyKVNode struct {
 	// Reference to a key store at that node
 	kvStore *KVStore
 
+	// snap shot directory
 	snapDir string
 }
 
@@ -38,7 +39,7 @@ func NewRaftyKVNode(nodeID uint64, peerIDs []uint64, raftNet *RaftNet) *RaftyKVN
 
 	snapShotter := snap.New(zap.NewExample(), snapDir)
 	return &RaftyKVNode{
-		raftyNode: NewRaftyNode(nodeID, peerIDs, raftNet),
+		raftyNode: NewRaftyNode(nodeID, peerIDs, raftNet, commitC, proposeC),
 		kvStore:   NewKVStore(snapShotter, proposeC, commitC, errorC),
 		snapDir:   snapDir,
 	}
@@ -112,12 +113,9 @@ func (rNet *RaftNet) ProposeChange(srcID uint64, key, value string) {
 		log.Panicf("cannot find node with id=%v", srcID)
 	}
 
-	data := fmt.Sprintf("%s:%s", key, value)
-	log.Infof("Apply data=%v at node=%v", data, src.raftyNode.id)
-	err := src.raftyNode.node.Propose(src.raftyNode.ctx, []byte(data))
-	if err != nil {
-		log.Panicf("error in node.Propose(...) err=%v", err)
-	}
+	defer log.Infof("Propose key=%v value=%v at node=%v",
+		key, value, src.raftyNode.id)
+	src.kvStore.Propose(key, value)
 }
 
 func (rNet *RaftNet) ReadFromAllNodes(key string) map[uint64]string {

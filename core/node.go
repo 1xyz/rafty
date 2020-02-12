@@ -1,7 +1,6 @@
 package core
 
 import (
-	"bytes"
 	log "github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
@@ -30,21 +29,23 @@ type RaftyNode struct {
 	// context required to send messages
 	ctx context.Context
 
-	// pstore is a fake implementation of a persistent storage
-	// that will be used side-by-side with the WAL in the raft
-	pstore map[string]string
-
 	// signals proposal channel closed
 	stopc chan struct{}
 
 	// references the raft network  this node is associated with
 	raftNet *RaftNet
+
+	// commit channel (all entries that need to be committed are sent here
+	commitC chan<- *string
+
+	// propose channel
+	proposeC <-chan string
 }
 
 const heartBeatInterval = 1
 const electionTimeoutInterval = 10 * heartBeatInterval
 
-func NewRaftyNode(id uint64, peerIds []uint64, raftNet *RaftNet) *RaftyNode {
+func NewRaftyNode(id uint64, peerIds []uint64, raftNet *RaftNet, commitC chan<- *string, proposeC <-chan string) *RaftyNode {
 	storage := raft.NewMemoryStorage()
 	cfg := &raft.Config{
 		ID:              id,
@@ -66,16 +67,35 @@ func NewRaftyNode(id uint64, peerIds []uint64, raftNet *RaftNet) *RaftyNode {
 	n := raft.StartNode(cfg, peers)
 	log.Infof("started node %v", n)
 	return &RaftyNode{
-		id:      id,
-		node:    n,
-		store:   storage,
-		raftNet: raftNet,
-		ctx:     context.TODO(),
-		pstore:  map[string]string{},
+		id:       id,
+		node:     n,
+		store:    storage,
+		raftNet:  raftNet,
+		ctx:      context.TODO(),
+		commitC:  commitC,
+		proposeC: proposeC,
 	}
 }
 
 func (rn *RaftyNode) Run() {
+	go func() {
+		// support cases where the nodes does not pick up proposals
+		for rn.proposeC != nil {
+			select {
+			case prop, ok := <-rn.proposeC:
+				if !ok {
+					log.Infof("proposeC to nil")
+					rn.proposeC = nil
+				} else {
+					err := rn.node.Propose(rn.ctx, []byte(prop))
+					if err != nil {
+						log.Panicf("rn.node.Propose(..) err=%v", err)
+					}
+				}
+			}
+		}
+	}()
+
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -184,11 +204,10 @@ func (rn *RaftyNode) processSnapshot(snapshot raftpb.Snapshot) {
 func (n *RaftyNode) process(entry raftpb.Entry) {
 	log.Infof("node %v: processing entry: %v Type: %v", n.id, entry, entry.Type)
 	if entry.Type == raftpb.EntryNormal && entry.Data != nil {
-		parts := bytes.SplitN(entry.Data, []byte(":"), 2)
-		key := string(parts[0])
-		value := string(parts[1])
-		log.Infof("Add/update value = %v", key, value)
-		n.pstore[key] = value
+		// ToDo: Don't see a point in making a str (is there an advantage to
+		// sending a slice across the channel
+		s := string(entry.Data)
+		n.commitC <- &s
 	} else {
 		log.Warnf("Skipping process entry")
 	}

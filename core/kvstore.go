@@ -32,7 +32,7 @@ func NewKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <
 	}
 
 	// replay log into key-value map
-	s.readCommits(commitC, errorC)
+	// s.readCommits(commitC, errorC)
 	// read commits from raft into kvStore map until error
 	go s.readCommits(commitC, errorC)
 	return s
