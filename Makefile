@@ -16,7 +16,7 @@ build: clean fmt
 	$(GO) build -o bin/$(BINARY) -v main.go
 
 run: build
-	bin/$(BINARY)
+	bin/$(BINARY) standalone 3
 
 test: clean fmt
 	$(GO) test ./...

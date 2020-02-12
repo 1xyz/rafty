@@ -3,12 +3,46 @@ package core
 import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"go.etcd.io/etcd/etcdserver/api/snap"
+	"go.etcd.io/etcd/pkg/fileutil"
 	"go.etcd.io/etcd/raft/raftpb"
+	"go.uber.org/zap"
 	"golang.org/x/net/context"
+	"os"
 	"time"
 )
 
-type raftNodeMap map[uint64]*RaftyNode
+type raftNodeMap map[uint64]*RaftyKVNode
+
+type RaftyKVNode struct {
+	// Reference to the raft node
+	raftyNode *RaftyNode
+
+	// Reference to a key store at that node
+	kvStore *KVStore
+
+	snapDir string
+}
+
+func NewRaftyKVNode(nodeID uint64, peerIDs []uint64, raftNet *RaftNet) *RaftyKVNode {
+	proposeC := make(chan string)
+	// confChangeC := make(chan raftpb.ConfChange)
+	commitC := make(chan *string)
+	errorC := make(chan error)
+	snapDir := fmt.Sprintf("/tmp/rafty/node-%d", nodeID)
+	if !fileutil.Exist(snapDir) {
+		if err := os.Mkdir(snapDir, 0750); err != nil {
+			log.Panicf("os.mkDir: cannot create dir for snapshot (%v)", err)
+		}
+	}
+
+	snapShotter := snap.New(zap.NewExample(), snapDir)
+	return &RaftyKVNode{
+		raftyNode: NewRaftyNode(nodeID, peerIDs, raftNet),
+		kvStore:   NewKVStore(snapShotter, proposeC, commitC, errorC),
+		snapDir:   snapDir,
+	}
+}
 
 type RaftNet struct {
 	nodes raftNodeMap
@@ -25,7 +59,7 @@ func NewRaftNet(nc uint64) *RaftNet {
 	}
 
 	for _, id := range peerIds {
-		raftNet.nodes[id] = NewRaftyNode(id, peerIds, raftNet)
+		raftNet.nodes[id] = NewRaftyKVNode(id, peerIds, raftNet)
 	}
 
 	return raftNet
@@ -34,7 +68,7 @@ func NewRaftNet(nc uint64) *RaftNet {
 func (rNet *RaftNet) Run() {
 	// campaign the first node, basically force node 1 to switch
 	// from follower to candidate, to try to become a leader
-	n1 := rNet.nodes[1]
+	n1 := rNet.nodes[1].raftyNode
 	log.Infof("Attempt to switch node %v to campaign mode", n1.id)
 	err := n1.node.Campaign(n1.ctx)
 	if err != nil {
@@ -45,10 +79,10 @@ func (rNet *RaftNet) Run() {
 	log.Infof("Attempt to start %v nodes", len(rNet.nodes))
 	for id, n := range rNet.nodes {
 		log.Infof("run node %v", id)
-		go n.Run()
+		go n.raftyNode.Run()
 	}
 
-	n2 := rNet.nodes[2]
+	n2 := rNet.nodes[2].raftyNode
 	log.Infof("Attempt a conf change to add node 3")
 	err = n2.node.ProposeConfChange(n2.ctx, raftpb.ConfChange{
 		ID:      3,
@@ -79,8 +113,8 @@ func (rNet *RaftNet) ProposeChange(srcID uint64, key, value string) {
 	}
 
 	data := fmt.Sprintf("%s:%s", key, value)
-	log.Infof("Apply data=%v at node=%v", data, src.id)
-	err := src.node.Propose(src.ctx, []byte(data))
+	log.Infof("Apply data=%v at node=%v", data, src.raftyNode.id)
+	err := src.raftyNode.node.Propose(src.raftyNode.ctx, []byte(data))
 	if err != nil {
 		log.Panicf("error in node.Propose(...) err=%v", err)
 	}
@@ -88,8 +122,8 @@ func (rNet *RaftNet) ProposeChange(srcID uint64, key, value string) {
 
 func (rNet *RaftNet) ReadFromAllNodes(key string) map[uint64]string {
 	result := make(map[uint64]string)
-	for nodeID, raftyNode := range rNet.nodes {
-		v, ok := raftyNode.pstore[key]
+	for nodeID, raftyKVNode := range rNet.nodes {
+		v, ok := raftyKVNode.kvStore.Lookup(key)
 		if ok {
 			result[nodeID] = v
 		} else {
@@ -101,5 +135,5 @@ func (rNet *RaftNet) ReadFromAllNodes(key string) map[uint64]string {
 }
 
 func (rNet *RaftNet) Send(ctx context.Context, id uint64, m raftpb.Message) {
-	rNet.nodes[id].recvRaftRPC(ctx, m)
+	rNet.nodes[id].raftyNode.recvRaftRPC(ctx, m)
 }
