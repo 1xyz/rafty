@@ -1,8 +1,10 @@
 # Rafty - Simulation of Raft processes 
 
-This experimental project is a simulation of multiple Raft nodes primarily to understand the usage of etcd library
+This is an experimental project, primarily to understand the usage of the etcd-raft library. 
 
-Here are some useful references that I have collected so far
+To summarize, rafty is a simulation of multiple Raft nodes in a single process. The different raftyNodes communicate with each other by calling a recvRPC on the nodes.  
+
+Here are some useful references that I have collected so far, that has helped me.
 
 References
 1) https://www.reddit.com/r/golang/comments/3dzprs/using_the_etcd_raft_to_build_your_first_cluster/
