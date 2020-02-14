@@ -30,19 +30,29 @@ func NewRaftyKVNode(nodeID uint64, peerIDs []uint64, raftNet *RaftNet) *RaftyKVN
 	// confChangeC := make(chan raftpb.ConfChange)
 	commitC := make(chan *string)
 	errorC := make(chan error)
-	snapDir := fmt.Sprintf("/tmp/rafty/node-%d", nodeID)
+	walDir := fmt.Sprintf("/tmp/rafty/node-%d/wal", nodeID)
+	snapDir := fmt.Sprintf("/tmp/rafty/node-%d/snap", nodeID)
 	if !fileutil.Exist(snapDir) {
+		log.Warnf("directory snapDir %v doesn't exist", snapDir)
 		if err := os.Mkdir(snapDir, 0750); err != nil {
 			log.Panicf("os.mkDir: cannot create dir for snapshot (%v)", err)
 		}
 	}
 
-	snapShotter := snap.New(zap.NewExample(), snapDir)
-	return &RaftyKVNode{
-		raftyNode: NewRaftyNode(nodeID, peerIDs, raftNet, commitC, proposeC),
-		kvStore:   NewKVStore(snapShotter, proposeC, commitC, errorC),
+	snapshotter := snap.New(zap.NewExample(), snapDir)
+	var kvs *KVStore
+	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
+	raftyNode := NewRaftyNode(nodeID, peerIDs, raftNet, walDir,
+		snapshotter, getSnapshot, commitC, proposeC)
+	kvs = NewKVStore(snapshotter, proposeC, commitC, errorC)
+	raftyKvNode := &RaftyKVNode{
+		raftyNode: raftyNode,
+		kvStore:   kvs,
 		snapDir:   snapDir,
 	}
+
+	<-raftyKvNode.raftyNode.nodeReadyC
+	return raftyKvNode
 }
 
 type RaftNet struct {
@@ -95,6 +105,7 @@ func (rNet *RaftNet) Run() {
 		log.Panicf("n2.node.ProposeConfChange err=%v", err)
 	}
 
+	log.Info("Attempt to retrieve status for node n1")
 	for i := 0; i < 2; i++ {
 		if n1.node.Status().Lead == 1 {
 			break

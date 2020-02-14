@@ -31,6 +31,8 @@ func NewKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <
 		store:       make(map[string]string),
 	}
 
+	log.Infof("readCommits...")
+	s.readCommits(commitC, errorC)
 	// replay log into key-value map
 	// s.readCommits(commitC, errorC)
 	// read commits from raft into kvStore map until error
@@ -64,6 +66,7 @@ func (s *KVStore) readCommits(commitC <-chan *string, errorC <-chan error) {
 	for data := range commitC {
 		if data == nil {
 			// ToDo: Fix, this is fairly vague way to load snapshots
+			// ToDo: Why? Since implicit signaling via a nil.
 			// done replaying log; new data incoming
 			// OR signaled to load snapshot
 			snapshot, err := s.snapShotter.Load()
@@ -86,7 +89,8 @@ func (s *KVStore) readCommits(commitC <-chan *string, errorC <-chan error) {
 		}
 
 		var dataKv kv
-		// ToDo: I don't particularly see a reason to pass a string ptr across the channel across
+		// ToDo: I don't particularly see a reason to pass a string ptr
+		// ToDo: across the channel across, why not just pass bytes.
 		dec := gob.NewDecoder(bytes.NewBufferString(*data))
 		if err := dec.Decode(&dataKv); err != nil {
 			log.Fatalf("raftexample: could not decode message (%v)", err)

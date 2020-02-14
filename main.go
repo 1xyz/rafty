@@ -21,7 +21,7 @@ func init() {
 	// log.SetFormatter(&log.JSONFormatter{})
 	log.SetFormatter(&log.TextFormatter{})
 	log.SetOutput(os.Stdout)
-	log.SetLevel(log.ErrorLevel)
+	log.SetLevel(log.InfoLevel)
 }
 
 func propose(raftNet *core.RaftNet, nodeId uint64, key, value string) {

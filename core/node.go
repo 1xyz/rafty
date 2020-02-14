@@ -2,10 +2,15 @@ package core
 
 import (
 	log "github.com/sirupsen/logrus"
+	"go.etcd.io/etcd/etcdserver/api/snap"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/wal"
+	"go.etcd.io/etcd/wal/walpb"
+	"go.uber.org/zap"
 	"golang.org/x/net/context"
 	"math"
+	"os"
 	"time"
 )
 
@@ -22,6 +27,12 @@ type RaftyNode struct {
 
 	// Underlying raft.Node
 	node raft.Node
+
+	// Configuration state of this node (I think)!!!
+	confState raftpb.ConfState
+
+	// function to retrieve the store snapshot as a byte slice
+	getSnapshot func() ([]byte, error)
 
 	// Underlying store
 	store *raft.MemoryStorage
@@ -40,12 +51,44 @@ type RaftyNode struct {
 
 	// propose channel
 	proposeC <-chan string
+
+	// reference to a write-ahead log
+	wal *wal.WAL
+
+	// path to dir, where the Write-ahead-log is stored
+	waldir string
+
+	// index of log at start (i.e when the WAL is loaded the first time)
+	lastIndex uint64
+
+	// Reference to a snapshotter which maintains a snapshot of the
+	// entire state of the store
+	snapshotter *snap.Snapshotter
+
+	// Indicates at what log-index the current snapshot is at
+	snapshotIndex uint64
+
+	// Indicates at what index we have entries to be written to snapshot
+	appliedIndex uint64
+
+	// a threshold which triggers writing to the snapshot
+	snapCount uint64
+
+	// singals when the node is started
+	nodeReadyC chan bool
 }
 
 const heartBeatInterval = 1
 const electionTimeoutInterval = 10 * heartBeatInterval
 
-func NewRaftyNode(id uint64, peerIds []uint64, raftNet *RaftNet, commitC chan<- *string, proposeC <-chan string) *RaftyNode {
+func NewRaftyNode(id uint64,
+	peerIds []uint64,
+	raftNet *RaftNet,
+	waldir string,
+	snapshotter *snap.Snapshotter,
+	getSnapshot func() ([]byte, error),
+	commitC chan<- *string,
+	proposeC <-chan string) *RaftyNode {
 	storage := raft.NewMemoryStorage()
 	cfg := &raft.Config{
 		ID:              id,
@@ -64,17 +107,44 @@ func NewRaftyNode(id uint64, peerIds []uint64, raftNet *RaftNet, commitC chan<- 
 		})
 	}
 
-	n := raft.StartNode(cfg, peers)
-	log.Infof("started node %v", n)
-	return &RaftyNode{
-		id:       id,
-		node:     n,
-		store:    storage,
-		raftNet:  raftNet,
-		ctx:      context.TODO(),
-		commitC:  commitC,
-		proposeC: proposeC,
+	rn := &RaftyNode{
+		id:          id,
+		store:       storage,
+		raftNet:     raftNet,
+		ctx:         context.TODO(),
+		commitC:     commitC,
+		proposeC:    proposeC,
+		snapshotter: snapshotter,
+		nodeReadyC:  make(chan bool),
+		getSnapshot: getSnapshot,
+		waldir:      waldir,
 	}
+
+	// ToDo: fix
+	// Start a the node, a true bool value is
+	// sent on readyNodeC channel
+	go startNode(rn, cfg, peers)
+
+	return rn
+}
+
+func startNode(rn *RaftyNode, cfg *raft.Config, peers []raft.Peer) {
+	// assumption - the snapshotter is setup and ready
+	// check to see if a wal directory exists.
+	oldwalExists := wal.Exist(rn.waldir)
+	// replay the WAL (for now its a snapshot)
+	rn.replayWAL()
+	if oldwalExists {
+		rn.node = raft.RestartNode(cfg)
+		log.Infof("re-started node %v", rn.node)
+	} else {
+		// start the node (since there is no WAL
+		rn.node = raft.StartNode(cfg, peers)
+		log.Infof("started node %v", rn.node)
+	}
+
+	// signal that this node is ready
+	rn.nodeReadyC <- true
 }
 
 func (rn *RaftyNode) Run() {
@@ -163,14 +233,158 @@ func (rn *RaftyNode) Run() {
 	}
 }
 
+// replayWAL replays WAL entries into the raft instance.
+// returns an instance of the WAL pointer
+func (rn *RaftyNode) replayWAL() *wal.WAL {
+	log.Infof("replaying WAL of member %d", rn.id)
+	// load the snapshot from the disk
+	snapshot := rn.loadSnapshot()
+
+	// open the write ahead log, the snapshot provides which
+	// index and term log to load from
+	// see the doc for WAL
+	// https://godoc.org/github.com/coreos/etcd/wal
+	w := rn.openWAL(snapshot)
+
+	// This will give you the metadata, the last raft.State (aka. hardState)
+	// and the slice of raft.Entry items in the log.
+	metadata, lastHardState, entries, err := w.ReadAll()
+	if err != nil {
+		log.Fatalf("raftexample: failed to read WAL (%v)", err)
+	}
+
+	log.Infof("metadata from replayWAL %v", len(metadata))
+	if snapshot != nil {
+		err := rn.store.ApplySnapshot(*snapshot)
+		if err != nil {
+			log.Fatalf("store.ApplySnapshot err=%v", err)
+		}
+	}
+
+	err = rn.store.SetHardState(lastHardState)
+	if err != nil {
+		log.Fatalf("store.SetHardState() err=%v", err)
+	}
+
+	// append to storage so raft starts at the right place in log
+	err = rn.store.Append(entries)
+	if err != nil {
+		log.Fatalf("store.Append(..) err=%v", err)
+	}
+
+	// send nil once lastIndex is published so client knows commit
+	// channel is current
+	if len(entries) > 0 {
+		rn.lastIndex = entries[len(entries)-1].Index
+	} else {
+		// ToDo: understand why nil is sent only in the else case  s
+		rn.commitC <- nil
+	}
+
+	return w
+}
+
+// openWAL returns a WAL ready for reading.
+func (rn *RaftyNode) openWAL(snapshot *raftpb.Snapshot) *wal.WAL {
+	if !wal.Exist(rn.waldir) {
+		log.Warnf("wal directory %s not found", rn.waldir)
+		if err := os.Mkdir(rn.waldir, 0750); err != nil {
+			log.Fatalf("raftexample: cannot create dir for wal (%v)", err)
+		}
+
+		w, err := wal.Create(zap.NewExample(), rn.waldir, nil)
+		if err != nil {
+			log.Fatalf("raftexample: create wal error (%v)", err)
+		}
+
+		err = w.Close()
+		if err != nil {
+			log.Fatalf("raftexample: error in w.close() err=%v", err)
+		}
+	}
+
+	walsnap := walpb.Snapshot{}
+	if snapshot != nil {
+		walsnap.Index, walsnap.Term = snapshot.Metadata.Index, snapshot.Metadata.Term
+	}
+
+	log.Printf("loading WAL at term %d and index %d",
+		walsnap.Term, walsnap.Index)
+	w, err := wal.Open(zap.NewExample(), rn.waldir, walsnap)
+	if err != nil {
+		log.Fatalf("raftexample: error loading wal (%v)", err)
+	}
+
+	return w
+}
+
+func (rn *RaftyNode) loadSnapshot() *raftpb.Snapshot {
+	snapshot, err := rn.snapshotter.Load()
+	if err != nil && err != snap.ErrNoSnapshot {
+		log.Fatalf("raftexample: error loading snapshot (%v)", err)
+	} else if err == snap.ErrNoSnapshot {
+		log.Warnf("No snapshot found!!!")
+	}
+
+	return snapshot
+}
+
+func (rn *RaftyNode) saveSnap(snap raftpb.Snapshot) error {
+	// must save the snapshot index to the WAL before saving the
+	// snapshot to maintain the invariant that we only Open the
+	// wal at previously-saved snapshot indexes.
+	walSnap := walpb.Snapshot{
+		Index: snap.Metadata.Index,
+		Term:  snap.Metadata.Term,
+	}
+	if err := rn.wal.SaveSnapshot(walSnap); err != nil {
+		return err
+	}
+	if err := rn.snapshotter.SaveSnap(snap); err != nil {
+		return err
+	}
+	return rn.wal.ReleaseLockTo(snap.Metadata.Index)
+}
+
+func (rc *RaftyNode) maybeTriggerSnapshot() {
+	// log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.appliedIndex, rc.snapshotIndex)
+	// data, err := rc.getSnapshot()
+	// if err != nil {
+	// 	log.Panic(err)
+	// }
+	// snap, err := rc.store.CreateSnapshot(rc.appliedIndex, &rc.confState, data)
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// if err := rc.saveSnap(snap); err != nil {
+	// 	panic(err)
+	// }
+	//
+	// compactIndex := uint64(1)
+	// if rc.appliedIndex > snapshotCatchUpEntriesN {
+	// 	compactIndex = rc.appliedIndex - snapshotCatchUpEntriesN
+	// }
+	// if err := rc.raftStorage.Compact(compactIndex); err != nil {
+	// 	panic(err)
+	// }
+	//
+	// log.Printf("compacted log at index %d", compactIndex)
+	// rc.snapshotIndex = rc.appliedIndex
+}
+
 func (rn *RaftyNode) saveToStorage(hardState raftpb.HardState,
 	entries []raftpb.Entry, snapshot raftpb.Snapshot) {
+	if len(entries) > 0 {
+		log.Warnf("entries is not empty empty!!!")
+	}
+
 	err := rn.store.Append(entries)
 	if err != nil {
 		log.Panicf("rn.store.Append error=%v", err)
 	}
 
 	if !raft.IsEmptyHardState(hardState) {
+		log.Warnf("hardstate is not empty")
 		err := rn.store.SetHardState(hardState)
 		if err != nil {
 			log.Panicf("rn.store.SetHardState error=%v", err)
@@ -178,7 +392,13 @@ func (rn *RaftyNode) saveToStorage(hardState raftpb.HardState,
 	}
 
 	if !raft.IsEmptySnap(snapshot) {
-		err := rn.store.ApplySnapshot(snapshot)
+		log.Warnf("saving snapshot...")
+		err := rn.saveSnap(snapshot)
+		if err != nil {
+			log.Panicf("rn.store.ApplySnapshot err=%v", err)
+		}
+
+		err = rn.store.ApplySnapshot(snapshot)
 		if err != nil {
 			log.Panicf("rn.store.ApplySnapshot err=%v", err)
 		}
